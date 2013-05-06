@@ -29,15 +29,13 @@ struct Data
  * Initialization hook, called FROM each thread. No assumptions about
  * module initialization state should be made.
  */
-Data* init()
+extern (C) void* rt_attachTLS()
 {
     auto data = cast(Data*).malloc(Data.sizeof);
-    *data = Data.init;
 
-    // do module specific initialization
+    *data = Data.init;
     data.tlsRanges = rt.sections.initTLSRanges();
     data.blockInfoCache = &rt.lifetime.__blkcache_storage;
-
     return data;
 }
 
@@ -45,12 +43,14 @@ Data* init()
  * Finalization hook, called FOR each thread. No assumptions about
  * module initialization state should be made.
  */
-void destroy(Data* data)
+extern (C) void rt_detachTLS(void* key)
 {
-    // do module specific finalization
-    rt.sections.finiTLSRanges(data.tlsRanges);
-
-    .free(data);
+    if (key !is null)
+    {
+        Data *data = cast(Data*) key;
+        rt.sections.finiTLSRanges(data.tlsRanges);
+        .free(data);
+    }
 }
 
 alias void delegate(void* pstart, void* pend) ScanDg;
@@ -59,10 +59,13 @@ alias void delegate(void* pstart, void* pend) ScanDg;
  * GC scan hook, called FOR each thread. Can be used to scan
  * additional thread local memory.
  */
-void scan(Data* data, scope ScanDg dg)
+extern (C) void rt_scanTLS(void* key, scope ScanDg dg)
 {
-    // do module specific marking
-    rt.sections.scanTLSRanges(data.tlsRanges, dg);
+    if (key !is null)
+    {
+        Data* data = cast(Data*) key;
+        rt.sections.scanTLSRanges(data.tlsRanges, dg);
+    }
 }
 
 alias int delegate(void* addr) IsMarkedDg;
@@ -72,8 +75,11 @@ alias int delegate(void* addr) IsMarkedDg;
  * additional thread local memory or associated data structures. Note
  * that only memory allocated from the GC can have marks.
  */
-void processGCMarks(Data* data, scope IsMarkedDg dg)
+extern (C) void rt_processGCMarks(void* key, scope IsMarkedDg dg)
 {
-    // do module specific sweeping
-    rt.lifetime.processGCMarks(*data.blockInfoCache, dg);
+    if (key !is null)
+    {
+        Data* data = cast(Data*) key;
+        rt.lifetime.processGCMarks(*data.blockInfoCache, dg);
+    }
 }

@@ -13,11 +13,11 @@ module core.thread;
 
 
 public import core.time; // for Duration
-static import rt.tlsgc;
-import rt.sections;
+
 
 // this should be true for most architectures
 version = StackGrowsDown;
+
 
 /**
  * Returns the process ID of the calling process, which is guaranteed to be
@@ -102,6 +102,15 @@ private
 
     alias void delegate() gc_atom;
     extern (C) void function(scope gc_atom) gc_atomic;
+
+    alias void delegate(void*, void*) ScanAllThreadsFn;
+    alias void delegate(ScanType, void*, void*) ScanAllThreadsTypeFn;
+    alias int delegate(void*) IsMarkedFn;
+
+    extern (C) void* rt_attachTLS();
+    extern (C) void rt_detachTLS(void*);
+    extern (C) void rt_scanTLS(void*, scope ScanAllThreadsFn);
+    extern (C) void rt_processGCMarks(void*, scope IsMarkedFn);
 }
 
 
@@ -136,7 +145,7 @@ version( Windows )
             assert( obj.m_curr is &obj.m_main );
             obj.m_main.bstack = getStackBottom();
             obj.m_main.tstack = obj.m_main.bstack;
-            obj.m_tlsgcdata = rt.tlsgc.init();
+            obj.m_tls         = rt_attachTLS();
 
             Thread.setThis( obj );
             //Thread.add( obj );
@@ -241,7 +250,7 @@ else version( Posix )
             assert( obj.m_curr is &obj.m_main );
             obj.m_main.bstack = getStackBottom();
             obj.m_main.tstack = obj.m_main.bstack;
-            obj.m_tlsgcdata = rt.tlsgc.init();
+            obj.m_tls         = rt_attachTLS();
 
             obj.m_isRunning = true;
             Thread.setThis( obj );
@@ -550,8 +559,8 @@ class Thread
         {
             m_tmach = m_tmach.init;
         }
-        rt.tlsgc.destroy( m_tlsgcdata );
-        m_tlsgcdata = null;
+        rt_detachTLS( m_tls );
+        m_tls = null;
     }
 
 
@@ -1262,7 +1271,7 @@ private:
     Context             m_main;
     Context*            m_curr;
     bool                m_lock;
-    rt.tlsgc.Data*      m_tlsgcdata;
+    void*               m_tls;
 
     version( Windows )
     {
@@ -1717,8 +1726,8 @@ extern (C) Thread thread_attachThis()
 
         thisThread.m_isRunning = true;
     }
+    thisThread.m_tls      = rt_attachTLS();
     thisThread.m_isDaemon = true;
-    thisThread.m_tlsgcdata = rt.tlsgc.init();
     Thread.setThis( thisThread );
 
     version( OSX )
@@ -1775,7 +1784,7 @@ version( Windows )
         if( addr == GetCurrentThreadId() )
         {
             thisThread.m_hndl = GetCurrentThreadHandle();
-            thisThread.m_tlsgcdata = rt.tlsgc.init();
+            thisThread.m_tls  = rt_attachTLS();
             Thread.setThis( thisThread );
         }
         else
@@ -1783,7 +1792,7 @@ version( Windows )
             thisThread.m_hndl = OpenThreadHandle( addr );
             impersonate_thread(addr,
             {
-                thisThread.m_tlsgcdata = rt.tlsgc.init();
+                thisThread.m_tls = rt_attachTLS();
                 Thread.setThis( thisThread );
             });
         }
@@ -1991,6 +2000,7 @@ body
 // Used for suspendAll/resumeAll below.
 private __gshared uint suspendDepth = 0;
 
+
 /**
  * Suspend the specified thread and load stack and register information for
  * use by thread_scanAll.  If the supplied thread is the calling thread,
@@ -2162,6 +2172,7 @@ private void suspend( Thread t )
     }
 }
 
+
 /**
  * Suspend all threads but the calling thread for "stop the world" garbage
  * collection runs.  This function may be called multiple times, and must
@@ -2264,6 +2275,7 @@ extern (C) void thread_suspendAll()
     }
 }
 
+
 /**
  * Resume the specified thread and unload stack and register information.
  * If the supplied thread is the calling thread, stack and register
@@ -2333,6 +2345,7 @@ private void resume( Thread t )
     }
 }
 
+
 /**
  * Resume all threads but the calling thread for "stop the world" garbage
  * collection runs.  This function must be called once for each preceding
@@ -2373,14 +2386,13 @@ body
     }
 }
 
+
 enum ScanType
 {
     stack,
     tls,
 }
 
-alias void delegate(void*, void*) ScanAllThreadsFn;
-alias void delegate(ScanType, void*, void*) ScanAllThreadsTypeFn;
 
 extern (C) void thread_scanAllType( scope ScanAllThreadsTypeFn scan )
 in
@@ -2389,7 +2401,7 @@ in
 }
 body
 {
-    callWithStackShell(sp => scanAllTypeImpl(scan, sp));
+    callWithStackShell( sp => scanAllTypeImpl( scan, sp ) );
 }
 
 
@@ -2447,26 +2459,30 @@ private void scanAllTypeImpl( scope ScanAllThreadsTypeFn scan, void* curStackTop
             scan( ScanType.stack, t.m_reg.ptr, t.m_reg.ptr + t.m_reg.length );
         }
 
-        if (t.m_tlsgcdata !is null)
-            rt.tlsgc.scan(t.m_tlsgcdata, (p1, p2) => scan(ScanType.tls, p1, p2));
+        if( t.m_tls !is null )
+        {
+            rt_scanTLS( t.m_tls, (p1, p2) => scan( ScanType.tls, p1, p2 ) );
+        }
     }
 }
 
 
 extern (C) void thread_scanAll( scope ScanAllThreadsFn scan )
 {
-    thread_scanAllType((type, p1, p2) => scan(p1, p2));
+    thread_scanAllType( (type, p1, p2) => scan(p1, p2) );
 }
+
 
 extern (C) void thread_enterCriticalRegion()
 in
 {
-    assert(Thread.getThis());
+    assert( Thread.getThis() );
 }
 body
 {
-    atomicStore(*cast(shared)&Thread.getThis().m_isInCriticalRegion, true);
+    atomicStore( *cast(shared) &Thread.getThis().m_isInCriticalRegion, true );
 }
+
 
 extern (C) void thread_exitCriticalRegion()
 in
@@ -2475,34 +2491,32 @@ in
 }
 body
 {
-    atomicStore(*cast(shared)&Thread.getThis().m_isInCriticalRegion, false);
+    atomicStore( *cast(shared) &Thread.getThis().m_isInCriticalRegion, false );
 }
+
 
 extern (C) bool thread_inCriticalRegion()
 in
 {
-    assert(Thread.getThis());
+    assert( Thread.getThis() );
 }
 body
 {
-    return atomicLoad(*cast(shared)&Thread.getThis().m_isInCriticalRegion);
+    return atomicLoad( *cast(shared) &Thread.getThis().m_isInCriticalRegion );
 }
+
 
 unittest
 {
-    assert(!thread_inCriticalRegion());
-
+    assert( !thread_inCriticalRegion() );
     {
         thread_enterCriticalRegion();
-
-        scope (exit)
-            thread_exitCriticalRegion();
-
-        assert(thread_inCriticalRegion());
+        scope (exit) thread_exitCriticalRegion();
+        assert( thread_inCriticalRegion() );
     }
-
-    assert(!thread_inCriticalRegion());
+    assert( !thread_inCriticalRegion() );
 }
+
 
 unittest
 {
@@ -2525,37 +2539,45 @@ unittest
     {
         thread_enterCriticalRegion();
 
-        assert(thread_inCriticalRegion());
-        assert(atomicLoad(*cast(shared)&Thread.getThis().m_isInCriticalRegion));
+        assert( thread_inCriticalRegion() );
+        assert( atomicLoad( *cast(shared) &Thread.getThis().m_isInCriticalRegion ) );
 
-        synchronized (cond1.mutex)
+        synchronized( cond1.mutex )
         {
             critical = true;
             cond1.notify();
         }
 
-        synchronized (cond2.mutex)
-            while (!stop)
+        synchronized( cond2.mutex )
+        {
+            while( !stop )
+            {
                 cond2.wait();
+            }
+        }
 
-        assert(thread_inCriticalRegion());
-        assert(atomicLoad(*cast(shared)&Thread.getThis().m_isInCriticalRegion));
+        assert( thread_inCriticalRegion());
+        assert( atomicLoad( *cast(shared) &Thread.getThis().m_isInCriticalRegion ) );
 
         thread_exitCriticalRegion();
 
-        assert(!thread_inCriticalRegion());
-        assert(!atomicLoad(*cast(shared)&Thread.getThis().m_isInCriticalRegion));
+        assert( !thread_inCriticalRegion());
+        assert( !atomicLoad( *cast(shared) &Thread.getThis().m_isInCriticalRegion ) );
     });
 
     thr.start();
 
-    synchronized (cond1.mutex)
-        while (!critical)
+    synchronized( cond1.mutex )
+    {
+        while( !critical )
+        {
             cond1.wait();
+        }
+    }
 
-    assert(atomicLoad(*cast(shared)&thr.m_isInCriticalRegion));
+    assert( atomicLoad( *cast(shared) &thr.m_isInCriticalRegion ) );
 
-    synchronized (cond2.mutex)
+    synchronized( cond2.mutex )
     {
         stop = true;
         cond2.notify();
@@ -2563,6 +2585,7 @@ unittest
 
     thr.join();
 }
+
 
 /**
  * This routine allows the runtime to process any special per-thread handling
@@ -2576,22 +2599,23 @@ unittest
  * In:
  *  This routine must be called just prior to resuming all threads.
  */
-extern(C) void thread_processGCMarks(scope rt.tlsgc.IsMarkedDg dg)
+extern(C) void thread_processGCMarks( scope IsMarkedFn isMarked )
 {
     for( Thread t = Thread.sm_tbeg; t; t = t.next )
     {
-        /* Can be null if collection was triggered between adding a
-         * thread and calling rt.tlsgc.init.
-         */
-        if (t.m_tlsgcdata !is null)
-            rt.tlsgc.processGCMarks(t.m_tlsgcdata, dg);
+        // NOTE: Thread.m_tls can be null if collection was triggered between
+        //       adding a thread and calling rt_attachTLS.
+        if( t.m_tls !is null )
+        {
+            rt_processGCMarks( t.m_tls, isMarked );
+        }
     }
 }
 
 
 extern (C)
 {
-    version (linux) int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
+    version (linux)   int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
     version (FreeBSD) int pthread_attr_get_np(pthread_t thread, pthread_attr_t* attr);
     version (Solaris) int thr_stksegment(stack_t* stk);
 }
